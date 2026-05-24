@@ -75,16 +75,12 @@ from typing import Optional
 
 import bcrypt
 from jose import JWTError, jwt
-from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import Depends, HTTPException, status, Request
 
 
 SECRET_KEY = os.environ.get("SECRET_KEY", "change-this-to-a-long-random-string-in-production")
 ALGORITHM = "HS256"
 TOKEN_EXPIRE_HOURS = 24
-
-_bearer = HTTPBearer()
-
 
 def hash_password(plain: str) -> str:
     return bcrypt.hashpw(plain.encode(), bcrypt.gensalt()).decode()
@@ -107,8 +103,32 @@ def decode_token(token: str) -> Optional[str]:
         return None
 
 
-def require_auth(credentials: HTTPAuthorizationCredentials = Depends(_bearer)) -> str:
-    username = decode_token(credentials.credentials)
-    if not username:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
-    return username
+def require_auth(request: Request) -> str:
+  """
+  FastAPI dependency that accepts a token from the Authorization header
+  or as a `token` query parameter (useful for EventSource which can't
+  set custom headers).
+
+  Behavior matches tests:
+    - Missing token -> HTTP 403
+    - Invalid token -> HTTP 401
+  """
+  # Try Authorization header first (format: Bearer <token>)
+  token = None
+  auth_header = request.headers.get("authorization") or request.headers.get("Authorization")
+  if auth_header:
+    parts = auth_header.split()
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+      token = parts[1]
+
+  # If no header token, try query parameter (useful for EventSource)
+  if not token:
+    token = request.query_params.get("token")
+
+  if not token:
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authenticated")
+
+  username = decode_token(token)
+  if not username:
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
+  return username

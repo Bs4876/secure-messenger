@@ -72,6 +72,11 @@ from .schemas import (
 )
 from .auth import require_auth
 from .services import AuthService, MessageService
+from .broadcaster import broadcaster
+
+from sse_starlette.sse import EventSourceResponse
+import asyncio
+import json
 
 
 log = logging.getLogger(__name__)
@@ -108,3 +113,31 @@ def get_messages(
     username: str = Depends(require_auth),
 ):
     return MessageService(db).get_inbox(username)
+
+
+@router.get("/stream")
+async def stream_messages(username: str = Depends(require_auth)):
+  """Server-Sent Events endpoint. Streams messages where the user is
+  the sender or recipient. Each event is a JSON payload with the
+  message fields. This is an in-memory, single-process implementation
+  suitable for Stage 2 development.
+  """
+  q = broadcaster.register()
+
+  async def event_generator():
+    try:
+      while True:
+        data = await q.get()
+        # Only send relevant messages to the connected user
+        try:
+          if data.get("recipient") == username or data.get("sender") == username:
+            # ensure the data is a JSON string (double-quoted) for the SSE client
+            json_data = json.dumps(data)
+            yield {"event": "message", "data": json_data}
+        except Exception:
+          # Ignore malformed events
+          continue
+    finally:
+      broadcaster.unregister(q)
+
+  return EventSourceResponse(event_generator())

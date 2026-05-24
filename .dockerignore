@@ -1,0 +1,16 @@
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+env/
+venv/
+build/
+dist/
+.pytest_cache
+test_messenger.db
+messenger.db
+.git
+.github
+node_modules
+*.egg-info

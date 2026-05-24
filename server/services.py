@@ -17,6 +17,7 @@ from .repositories import UserRepository, MessageRepository
 from .auth import hash_password, verify_password, create_token
 from .crypto import encrypt, decrypt
 from .schemas import MessageResponse
+from .broadcaster import broadcaster
 
 
 class AuthService:
@@ -41,6 +42,37 @@ class MessageService:
 
     def send(self, sender: str, recipient: str, content: str) -> MessageResponse:
         msg = self.messages.create(sender, recipient, encrypt(content))
+        # Publish a lightweight event for real-time clients (Stage 2)
+        # We don't await here to keep API response fast; schedule publish
+        # Publish an event to the broadcaster without blocking the response.
+        # Scheduling must be careful because tests may run in a sync context
+        # where no event loop is running.
+        try:
+            import asyncio
+
+            payload = {
+                "id": msg.id,
+                "sender": msg.sender,
+                "recipient": msg.recipient,
+                "content": content,
+                "created_at": msg.created_at.isoformat(),
+            }
+
+            # Publish synchronously from a lightweight background thread so
+            # the SSE subscribers receive the event immediately without
+            # blocking the request thread.
+            import threading
+
+            def _bg_publish():
+                try:
+                    broadcaster.publish(payload)
+                except Exception:
+                    pass
+
+            threading.Thread(target=_bg_publish, daemon=True).start()
+        except Exception:
+            # Never let real-time failures break the regular API
+            pass
         return MessageResponse(
             id=msg.id, sender=msg.sender, recipient=msg.recipient,
             content=content, created_at=msg.created_at,
