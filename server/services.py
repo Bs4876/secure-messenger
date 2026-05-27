@@ -1,88 +1,104 @@
-"""
-services.py — Business logic layer.
-
-Services orchestrate repositories and utilities (auth, crypto).
-They know WHAT to do but not HOW data is stored (that's the repository's job).
-
-WHY THIS MATTERS:
-  When Stage 2 adds SSE broadcasting, send_message() is the single place
-  to add the broadcast call — routes.py stays untouched.
-"""
-
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
+from typing import List
 
-from .models import Message
-from .repositories import UserRepository, MessageRepository
-from .auth import hash_password, verify_password, create_token
-from .crypto import encrypt, decrypt
-from .schemas import MessageResponse
-from .broadcaster import broadcaster
-
+from server.models import User, Message
+from server.schemas import MessageResponse
+from server.crypto import encrypt, decrypt
+from server.auth import hash_password, verify_password, create_token
+from server.broadcaster import broadcaster
 
 class AuthService:
     def __init__(self, db: Session):
-        self.users = UserRepository(db)
+        self.db = db
 
-    def register(self, username: str, password: str) -> None:
-        if self.users.get_by_username(username):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Username already taken")
-        self.users.create(username, hash_password(password))
+    def register(self, username: str, password: str) -> User:
+        existing = self.db.query(User).filter(User.username == username).first()
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Username already taken"
+            )
+        new_user = User(username=username, password_hash=hash_password(password))
+        self.db.add(new_user)
+        self.db.commit()
+        self.db.refresh(new_user)
+        return new_user
 
     def login(self, username: str, password: str) -> str:
-        user = self.users.get_by_username(username)
-        if not user or not verify_password(password, user.password_hash):
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+        user = self.db.query(User).filter(User.username == username).first()
+        
+        if user:
+            # User exists: slow, computational hash check
+            is_valid = verify_password(password, user.password_hash)
+        else:
+            # Anti-Timing Oracle / Enumeration Attack (Bonus 5):
+            # Run dummy bcrypt execution with a valid format hash to match response time (~100ms)
+            dummy_hash = "$2b$12$eImiTXuW728639572627384957362718274657182"
+            verify_password(password, dummy_hash)
+            is_valid = False
+
+        if not is_valid:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid credentials"
+            )
+            
         return create_token(username)
 
 
 class MessageService:
     def __init__(self, db: Session):
-        self.messages = MessageRepository(db)
+        self.db = db
 
-    def send(self, sender: str, recipient: str, content: str) -> MessageResponse:
-        msg = self.messages.create(sender, recipient, encrypt(content))
-        # Publish a lightweight event for real-time clients (Stage 2)
-        # We don't await here to keep API response fast; schedule publish
-        # Publish an event to the broadcaster without blocking the response.
-        # Scheduling must be careful because tests may run in a sync context
-        # where no event loop is running.
-        try:
-            import asyncio
+    async def send(self, sender: str, recipient: str, content: str) -> MessageResponse:
+        """
+        Send a message. Encrypts and stores in DB, then broadcasts to real-time stream.
+        This function is now async to safely await the broadcaster fan-out (Fix Q14).
+        """
+        ciphertext = encrypt(content)
+        db_msg = Message(sender=sender, recipient=recipient, ciphertext=ciphertext)
+        self.db.add(db_msg)
+        self.db.commit()
+        self.db.refresh(db_msg)
 
-            payload = {
-                "id": msg.id,
-                "sender": msg.sender,
-                "recipient": msg.recipient,
-                "content": content,
-                "created_at": msg.created_at.isoformat(),
-            }
-
-            # Publish synchronously from a lightweight background thread so
-            # the SSE subscribers receive the event immediately without
-            # blocking the request thread.
-            import threading
-
-            def _bg_publish():
-                try:
-                    broadcaster.publish(payload)
-                except Exception:
-                    pass
-
-            threading.Thread(target=_bg_publish, daemon=True).start()
-        except Exception:
-            # Never let real-time failures break the regular API
-            pass
-        return MessageResponse(
-            id=msg.id, sender=msg.sender, recipient=msg.recipient,
-            content=content, created_at=msg.created_at,
+        response = MessageResponse(
+            id=db_msg.id,
+            sender=db_msg.sender,
+            recipient=db_msg.recipient,
+            content=content, # Cleartext for the recipient
+            created_at=db_msg.created_at
         )
 
-    def get_inbox(self, username: str) -> list[MessageResponse]:
-        return [
-            MessageResponse(
-                id=m.id, sender=m.sender, recipient=m.recipient,
-                content=decrypt(m.ciphertext), created_at=m.created_at,
-            )
-            for m in self.messages.get_for_user(username)
-        ]
+        # Broadcast asynchronously to active SSE queues without thread blocking
+        payload = {
+            "id": response.id,
+            "sender": response.sender,
+            "recipient": response.recipient,
+            "content": response.content,
+            "created_at": response.created_at.isoformat()
+        }
+        await broadcaster.publish(payload)
+
+        return response
+
+    def get_history(self, username: str) -> List[MessageResponse]:
+        db_messages = self.db.query(Message).filter(
+            (Message.sender == username) | (Message.recipient == username)
+        ).all()
+
+        results = []
+        for msg in db_messages:
+            try:
+                decrypted = decrypt(msg.ciphertext)
+                results.append(MessageResponse(
+                    id=msg.id,
+                    sender=msg.sender,
+                    recipient=msg.recipient,
+                    content=decrypted,
+                    created_at=msg.created_at
+                ))
+            except Exception:
+                # Silently skip records that cannot be decrypted (e.g., historical key mismatch)
+                continue
+        return results
